@@ -1,0 +1,25 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Build output; publish the EXE as a GitHub Release asset.
+/build/
+/dist/
+
+# Local settings and runtime reports
+monitor-settings.json
+failover-state.json
+*-report.json
+node-switch-log.jsonl
+*.log
+
+# Temporary test directories
+/tests/tmp*/
+
+# Local secrets
+.env
+.env.*
+!.env.example
