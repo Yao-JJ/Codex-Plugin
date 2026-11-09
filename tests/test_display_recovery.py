@@ -1,5 +1,7 @@
 import unittest
-from unittest.mock import Mock
+import threading
+import time
+from unittest.mock import Mock, patch
 from codex_monitor import Window
 
 
@@ -12,6 +14,8 @@ class DisplayRecoveryTests(unittest.TestCase):
         w.dock_side = "right"
         w.dock_y = y
         w.screen_signature = (area, 96.0)
+        w.last_visibility_check = 0
+        w.last_heartbeat = time.monotonic()
         w.root = Mock()
         w.root.winfo_fpixels.return_value = 96
         w.root.winfo_width.return_value = 72
@@ -53,6 +57,15 @@ class DisplayRecoveryTests(unittest.TestCase):
         w.ensure_visible()
         w.root.geometry.assert_not_called()
 
+    def test_topmost_is_periodically_reasserted_without_moving_window(self):
+        w = self.window()
+        w.last_visibility_check = 10
+        w.last_heartbeat = 10
+        with patch("codex_monitor.time.monotonic", return_value=16):
+            w.ensure_visible()
+        w.root.attributes.assert_called_once_with("-topmost", True)
+        w.root.geometry.assert_not_called()
+
     def test_does_not_interrupt_dragging(self):
         w = self.window(x=2500)
         w.dragging = True
@@ -88,6 +101,88 @@ class DisplayRecoveryTests(unittest.TestCase):
         w.ensure_visible()
         w.set_view.assert_called_once_with(False)
         self.assertTrue(w.root.geometry.called)
+
+
+class FollowAndRefreshTests(unittest.TestCase):
+    def window(self):
+        w = Window.__new__(Window)
+        w.root = Mock()
+        w.stop = threading.Event()
+        w.app_available = True
+        w.app_absent_samples = 0
+        w.ensure_visible = Mock()
+        return w
+
+    def test_transient_missing_process_does_not_hide_paw(self):
+        w = self.window()
+        for available in (False, False, True):
+            w.observe_app_available(available)
+        w.root.withdraw.assert_not_called()
+        self.assertTrue(w.app_available)
+
+    def test_confirmed_exit_hides_and_restart_restores_paw(self):
+        w = self.window()
+        for _ in range(3):
+            w.observe_app_available(False)
+        w.root.withdraw.assert_called_once()
+        self.assertFalse(w.app_available)
+        w.observe_app_available(True)
+        w.root.deiconify.assert_called_once()
+        self.assertTrue(w.app_available)
+        w.ensure_visible.assert_called_once_with(force=True)
+
+    def test_unknown_breaks_absence_streak(self):
+        w = self.window()
+        for available in (False, False, None, False, False):
+            w.observe_app_available(available)
+        w.root.withdraw.assert_not_called()
+
+    def test_failed_show_is_retried_on_next_observation(self):
+        w = self.window()
+        w.app_available = False
+        w.root.deiconify.side_effect = [RuntimeError("display transition"), None]
+        with self.assertRaises(RuntimeError):
+            w.observe_app_available(True)
+        self.assertFalse(w.app_available)
+        w.observe_app_available(True)
+        self.assertTrue(w.app_available)
+        self.assertEqual(w.root.deiconify.call_count, 2)
+
+    def test_refresh_exception_still_recovers_visibility_and_schedules_next_tick(self):
+        w = self.window()
+        w.refresh = Mock(side_effect=RuntimeError("temporary UI error"))
+        with patch("codex_monitor.log_exception") as log:
+            w.tick()
+        log.assert_called_once()
+        w.ensure_visible.assert_called_once()
+        w.root.after.assert_called_once_with(500, w.tick)
+
+    def test_recovery_exception_does_not_stop_future_ticks(self):
+        w = self.window()
+        w.refresh = Mock()
+        w.ensure_visible.side_effect = RuntimeError("temporary display error")
+        with patch("codex_monitor.log_exception"):
+            w.tick()
+        w.root.after.assert_called_once_with(500, w.tick)
+
+    def test_close_during_refresh_does_not_reschedule(self):
+        w = self.window()
+        w.refresh = Mock(side_effect=w.stop.set)
+        w.tick()
+        w.ensure_visible.assert_not_called()
+        w.root.after.assert_not_called()
+
+
+class ProcessDetectionTests(unittest.TestCase):
+    def test_failed_enumeration_is_unknown_instead_of_absent(self):
+        kernel = Mock()
+        kernel.CreateToolhelp32Snapshot.return_value = 42
+        kernel.Process32FirstW.return_value = False
+        with patch("codex_monitor.ctypes.WinDLL", return_value=kernel), \
+                patch("codex_monitor.ctypes.get_last_error", return_value=5):
+            from codex_monitor import codex_running
+            self.assertIsNone(codex_running(desktop_only=True))
+        kernel.CloseHandle.assert_called_once_with(42)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ Windows 桌面置顶小窗，Python 3.10+，仅用标准库，无需安装依赖
 
 ## 下载与历史版本
 
-[下载 Windows 最新版](https://github.com/Yao-JJ/Codex-Plugin/releases/latest/download/CodexMonitor.exe) · [历史版本下载](https://github.com/Yao-JJ/Codex-Plugin/releases) · [v1.0.0 更新说明](RELEASE_NOTES.md)
+[下载 Windows 最新版](https://github.com/Yao-JJ/Codex-Plugin/releases/latest/download/CodexMonitor.exe) · [历史版本下载](https://github.com/Yao-JJ/Codex-Plugin/releases) · [v1.0.1 更新说明](RELEASE_NOTES.md)
 
 本仓库为私有仓库，访问源码、发行版和下载附件需要登录具有仓库访问权限的 GitHub 账号。
 
@@ -13,6 +13,8 @@ Windows 桌面置顶小窗，Python 3.10+，仅用标准库，无需安装依赖
 ## 使用说明
 
 屏幕分辨率、缩放或主屏幕工作区变化时，每半秒检查并自动重新贴边，将猫爪留在可见范围内，保留左右侧偏好并按比例调整垂直位置。意外缩小或隐藏时会在 Codex 仍运行的情况下恢复显示；Codex 退出导致的主动隐藏保持有效。完整面板无法适应很小的工作区时会自动退回猫爪。当前贴边目标为主屏幕工作区。
+
+跟随模式连续三次确认未检测到 Codex 才隐藏，无法确认进程状态时保留当前显示状态。界面刷新遇到异常后会继续尝试刷新和恢复显示，每 5 秒重新设置置顶。运行状态、隐藏/恢复原因和异常位置写入程序同目录的 `monitor-runtime.log`（每份最大 512 KiB，保留两份备份）；每分钟记录一次可见状态。Python 可捕获的原生崩溃栈写入 `monitor-fault.log`。诊断日志不记录聊天正文和异常消息；窗口位置、进程号和代码路径可能出现在日志中。
 
 EXE 版：直接双击 `dist\CodexMonitor.exe`，无需另装 Python，可单独复制 EXE 到其他文件夹使用。设置保存在 EXE 所在文件夹的 `monitor-settings.json`，建议放在自己可写的普通文件夹。单文件版启动时会临时解包运行库。
 

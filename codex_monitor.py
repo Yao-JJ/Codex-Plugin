@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import faulthandler
 from contextlib import contextmanager
 from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import queue
@@ -17,15 +20,46 @@ import ssl
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from clash_failover import ClashClient, FailoverGuard
 
 BASE = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 CONFIG = BASE / "monitor-settings.json"
+LOG = logging.getLogger("codex_monitor")
+LOG.addHandler(logging.NullHandler())
+FAULT_STREAM = None
 TAB_WIDTH, TAB_HEIGHT = 72, 64
 PAD_COLOR = "#b78498"
 NETWORK_ERROR = re.compile(r"connection (?:reset|refused|closed)|timed? out|timeout|dns|proxy|tls|ssl|network is unreachable|stream disconnected|error sending request|failed to connect|websocket.*(?:error|fail)|reconnecting", re.I)
+
+
+def log_exception(context, exc_type, exc, tb):
+    # Record locations without exception messages or source lines that may contain
+    # proxy credentials or session contents.
+    frames = [(f.filename, f.lineno, f.name, None) for f in traceback.extract_tb(tb)]
+    LOG.error("%s: %s\n%s", context, exc_type.__name__, "".join(traceback.format_list(frames)))
+
+
+def setup_logging():
+    global FAULT_STREAM
+    try:
+        handler = RotatingFileHandler(BASE / "monitor-runtime.log", maxBytes=512 * 1024,
+                                      backupCount=2, encoding="utf-8")
+    except OSError:
+        return
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    LOG.addHandler(handler)
+    LOG.setLevel(logging.INFO)
+    try:
+        FAULT_STREAM = (BASE / "monitor-fault.log").open("a", encoding="utf-8")
+        faulthandler.enable(file=FAULT_STREAM)
+    except (OSError, RuntimeError):
+        LOG.warning("Native fault logging unavailable")
+    sys.excepthook = lambda *args: log_exception("main", *args)
+    threading.excepthook = lambda args: log_exception("worker " + args.thread.name,
+                                                     args.exc_type, args.exc_value, args.exc_traceback)
 
 
 def timestamp(value):
@@ -200,7 +234,9 @@ def codex_running(desktop_only=False):
                     else:
                         inaccessible = True
             ok = kernel.Process32NextW(handle, ctypes.byref(entry))
-        return None if inaccessible else False
+        # Only ERROR_NO_MORE_FILES confirms a complete process enumeration.
+        # A failed enumeration must not be treated as the app having exited.
+        return None if inaccessible or ctypes.get_last_error() != 18 else False
     finally:
         kernel.CloseHandle(handle)
 
@@ -334,6 +370,9 @@ class Window:
         self.demo = demo
         self.follow_codex = follow_codex
         self.app_available = False
+        self.app_absent_samples = 0
+        self.last_visibility_check = 0
+        self.last_heartbeat = 0
         self.monitor = Monitor(home)
         self.settings = load_settings()
         self.dock_side = self.settings.get("dock_side", "right")
@@ -343,6 +382,7 @@ class Window:
         self.warn = max(10, int(self.settings.get("warn_seconds", 60)))
         self.severe = max(self.warn + 1, int(self.settings.get("severe_seconds", 180)))
         self.root = tk.Tk()
+        self.root.report_callback_exception = lambda *args: log_exception("Tk callback", *args)
         if follow_codex:
             self.root.withdraw()
         self.root.title("Codex 悬浮监测 · 模拟测试" if demo else "Codex 悬浮监测")
@@ -465,6 +505,7 @@ class Window:
         if not should_show:
             return  # Preserve intentional hiding when Codex exits.
         if self.root.state() in ("withdrawn", "iconic"):
+            LOG.warning("Restoring unexpected window state=%s", self.root.state())
             self.root.deiconify()
             self.root.update_idletasks()
             force = True
@@ -479,6 +520,7 @@ class Window:
         changed = previous is not None and previous != signature
         outside = x < left or y < top or x + width > right or y + height > bottom
         if force or changed or outside:
+            LOG.info("Reposition window force=%s display_changed=%s outside=%s area=%s", force, changed, outside, area)
             if changed:
                 old_left, old_top, old_right, old_bottom = previous[0]
                 old_span = max(1, old_bottom - old_top - height)
@@ -488,6 +530,17 @@ class Window:
                 self.dock_y = max(top, min(y, bottom - height))
             self.dock_geometry(width, height)
             self.root.attributes("-topmost", True)
+        # Windows can change z-order without changing Tk's state or geometry.
+        # Reassert topmost periodically, without activating or moving the window.
+        now = time.monotonic()
+        if now - self.last_visibility_check >= 5:
+            self.root.attributes("-topmost", True)
+            self.last_visibility_check = now
+        if now - self.last_heartbeat >= 60:
+            LOG.info("UI alive available=%s state=%s viewable=%s rect=%s",
+                     self.app_available, self.root.state(), self.root.winfo_viewable(),
+                     self.root.geometry())
+            self.last_heartbeat = now
 
     def draw_tab(self):
         c = self.compact
@@ -700,23 +753,51 @@ class Window:
     def set_app_available(self, available):
         if available is None or available == self.app_available:
             return
-        self.app_available = available
+        LOG.info("Codex availability changed %s -> %s", self.app_available, available)
         if available:
             self.root.deiconify()
             self.root.attributes("-topmost", True)
             self.root.update_idletasks()
-            self.ensure_visible(force=True)
         else:
             self.root.withdraw()
+        self.app_available = available
+        if available:
+            self.ensure_visible(force=True)
+
+    def observe_app_available(self, available):
+        # One transient negative result must not hide the entire paw. Unknown
+        # results preserve visibility and interrupt the consecutive-miss count.
+        if available is False:
+            self.app_absent_samples += 1
+            if self.app_absent_samples < 3:
+                return
+        else:
+            self.app_absent_samples = 0
+        self.set_app_available(available)
 
     def tick(self):
+        if self.stop.is_set():
+            return
+        try:
+            self.refresh()
+        except Exception:
+            log_exception("UI refresh", *sys.exc_info())
+        finally:
+            if not self.stop.is_set():
+                try:
+                    self.ensure_visible()
+                except Exception:
+                    log_exception("Visibility recovery", *sys.exc_info())
+                self.root.after(500, self.tick)
+
+    def refresh(self):
         while True:
             try:
                 kind, data = self.updates.get_nowait()
             except queue.Empty:
                 break
             if kind == "availability":
-                self.set_app_available(data)
+                self.observe_app_available(data)
             elif kind == "failover":
                 self.switch_message = data
             elif kind == "sessions":
@@ -774,10 +855,9 @@ class Window:
         if self.detail.get():
             self.fit_details()
         self.update_auto_collapse()
-        self.ensure_visible()
-        self.root.after(500, self.tick)
 
     def close(self):
+        LOG.info("Window closed by request demo=%s", self.demo)
         self.stop.set()
         settings = {"warn_seconds": self.warn, "severe_seconds": self.severe, "x": self.root.winfo_x(), "y": self.root.winfo_y(), "dock_side": self.dock_side, "dock_y": self.root.winfo_y(), "network_probe": self.network_on.get(), "auto_switch": self.auto_switch.get()}
         if not self.demo:
@@ -927,4 +1007,8 @@ def main():
 
 
 if __name__ == "__main__":
+    setup_logging()
+    LOG.info("Starting pid=%s frozen=%s follow_codex=%s", os.getpid(),
+             bool(getattr(sys, "frozen", False)), "--follow-codex" in sys.argv)
     main()
+    LOG.info("Main returned normally")
