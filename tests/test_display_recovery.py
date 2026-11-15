@@ -108,6 +108,7 @@ class FollowAndRefreshTests(unittest.TestCase):
         w = Window.__new__(Window)
         w.root = Mock()
         w.stop = threading.Event()
+        w.gc_guard = None
         w.app_available = True
         w.app_absent_samples = 0
         w.ensure_visible = Mock()
@@ -178,7 +179,7 @@ class ProcessDetectionTests(unittest.TestCase):
         kernel = Mock()
         kernel.CreateToolhelp32Snapshot.return_value = 42
         kernel.Process32FirstW.return_value = False
-        with patch("codex_monitor.ctypes.WinDLL", return_value=kernel), \
+        with patch("codex_monitor.WIN32", Mock(kernel=kernel)), \
                 patch("codex_monitor.ctypes.get_last_error", return_value=5):
             from codex_monitor import codex_running
             self.assertIsNone(codex_running(desktop_only=True))

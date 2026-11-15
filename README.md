@@ -4,7 +4,7 @@ Windows 桌面置顶小窗，Python 3.10+，仅用标准库，无需安装依赖
 
 ## 下载与历史版本
 
-[下载 Windows 最新版](https://github.com/Yao-JJ/Codex-Plugin/releases/latest/download/CodexMonitor.exe) · [历史版本下载](https://github.com/Yao-JJ/Codex-Plugin/releases) · [v1.0.1 更新说明](RELEASE_NOTES.md)
+[下载 Windows 最新版](https://github.com/Yao-JJ/Codex-Plugin/releases/latest/download/CodexMonitor.exe) · [历史版本下载](https://github.com/Yao-JJ/Codex-Plugin/releases) · [v1.0.2 更新说明](RELEASE_NOTES.md)
 
 本仓库为私有仓库，访问源码、发行版和下载附件需要登录具有仓库访问权限的 GitHub 账号。
 
@@ -15,6 +15,8 @@ Windows 桌面置顶小窗，Python 3.10+，仅用标准库，无需安装依赖
 屏幕分辨率、缩放或主屏幕工作区变化时，每半秒检查并自动重新贴边，将猫爪留在可见范围内，保留左右侧偏好并按比例调整垂直位置。意外缩小或隐藏时会在 Codex 仍运行的情况下恢复显示；Codex 退出导致的主动隐藏保持有效。完整面板无法适应很小的工作区时会自动退回猫爪。当前贴边目标为主屏幕工作区。
 
 跟随模式连续三次确认未检测到 Codex 才隐藏，无法确认进程状态时保留当前显示状态。界面刷新遇到异常后会继续尝试刷新和恢复显示，每 5 秒重新设置置顶。运行状态、隐藏/恢复原因和异常位置写入程序同目录的 `monitor-runtime.log`（每份最大 512 KiB，保留两份备份）；每分钟记录一次可见状态。Python 可捕获的原生崩溃栈写入 `monitor-fault.log`。诊断日志不记录聊天正文和异常消息；窗口位置、进程号和代码路径可能出现在日志中。
+
+Windows API 的 DLL、结构类型和函数签名在启动时初始化并持续复用，避免每轮进程检测都创建并缓存新类型。GUI 运行期间关闭自动循环垃圾回收，改由界面主线程每 10 秒回收一次；普通引用计数释放仍然有效。退出时等待后台线程结束后再释放窗口持有关系并恢复原垃圾回收状态，避免后台线程回收 Tcl/Tk 对象。
 
 EXE 版：直接双击 `dist\CodexMonitor.exe`，无需另装 Python，可单独复制 EXE 到其他文件夹使用。设置保存在 EXE 所在文件夹的 `monitor-settings.json`，建议放在自己可写的普通文件夹。单文件版启动时会临时解包运行库。
 
@@ -52,9 +54,12 @@ python -m unittest discover -s tests -v
 python codex_monitor.py --once
 python codex_monitor.py --once --probe
 python codex_monitor.py --self-test
+python codex_monitor.py --stress-test 180
 ```
 
 `--self-test` 打开单独标注的模拟窗口，约 17 秒内依次展示运行、无活动提醒、长时间无活动、模拟连接异常、恢复和任务完成，并检查收起/展开和布局。测试结束自动关闭，结果保存到同目录 `self-test-report.json`；不读取或改写真实会话、不探测网络，也不保存窗口设置。
+
+`--stress-test 秒数`（10–3600 秒）在独立模拟窗口中高频调用真实 Windows 进程检测，同时反复创建/销毁控件、展开/收起和模拟隐藏/恢复。检查指针类型缓存、句柄数、Python 内存和回收线程，报告保存到同目录 `stress-test-report.json`。先运行两秒界面初始化，再开始计时和资源测量。测试不读取聊天、不探测网络、不切换节点，也不保存设置；EXE 支持相同参数。
 
 界面不显示原始错误正文、代理地址或密钥。诊断输出包含聊天 ID 和工具名，分享前按需检查。Codex 的本地存储属于内部格式；未来更新可能需要调整读取逻辑，读取失败会显示在窗口内。
 
@@ -75,6 +80,9 @@ Codex-Plugin/
 ├─ README.md
 ├─ codex_monitor.py
 ├─ clash_failover.py
+├─ windows_api.py          # 启动时缓存 Win32 接口和结构类型
+├─ gui_gc.py               # 在界面主线程回收循环引用
+├─ monitor_stress.py       # EXE 原生检测与界面压力测试
 ├─ build-exe.ps1
 ├─ install-autostart.ps1
 ├─ 启动悬浮窗.vbs

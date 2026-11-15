@@ -24,6 +24,8 @@ import traceback
 import urllib.error
 import urllib.request
 from clash_failover import ClashClient, FailoverGuard
+from gui_gc import GuiGarbageCollector
+from windows_api import API as WIN32, ProcessEntry
 
 BASE = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 CONFIG = BASE / "monitor-settings.json"
@@ -190,26 +192,12 @@ def classify(session, now, warn=60, severe=180, running=True, probe_failed=False
 def codex_running(desktop_only=False):
     if os.name != "nt":
         return True
-    class Entry(ctypes.Structure):
-        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
-                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
-                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
-                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
-                    ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    kernel.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(Entry)]
-    kernel.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(Entry)]
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel.OpenProcess.restype = wintypes.HANDLE
-    kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel = WIN32.kernel
     handle = kernel.CreateToolhelp32Snapshot(2, 0)
     if handle == ctypes.c_void_p(-1).value:
         return None
     try:
-        entry = Entry()
+        entry = ProcessEntry()
         entry.dwSize = ctypes.sizeof(entry)
         ok = kernel.Process32FirstW(handle, ctypes.byref(entry))
         inaccessible = False
@@ -246,10 +234,7 @@ def single_instance():
     if os.name != "nt":
         yield True
         return
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
-    kernel.CreateMutexW.restype = wintypes.HANDLE
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel = WIN32.kernel
     handle = kernel.CreateMutexW(None, False, "Local\\CodexActivityMonitorV1")
     error = ctypes.get_last_error()
     try:
@@ -363,10 +348,12 @@ def load_settings():
 
 
 class Window:
-    def __init__(self, home, demo=False, follow_codex=False):
+    def __init__(self, home, demo=False, follow_codex=False, gc_guard=None):
         import tkinter as tk
         from tkinter import ttk
         self.tk = tk
+        self.gc_guard = gc_guard
+        self.workers = []
         self.demo = demo
         self.follow_codex = follow_codex
         self.app_available = False
@@ -453,8 +440,10 @@ class Window:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.set_view(False)
         if not demo:
-            threading.Thread(target=self.poll_worker, daemon=True).start()
-            threading.Thread(target=self.network_worker, daemon=True).start()
+            for target in (self.poll_worker, self.network_worker):
+                worker = threading.Thread(target=target, daemon=True, name=target.__name__)
+                self.workers.append(worker)
+                worker.start()
         self.root.after(200, self.tick)
 
     def label(self, text, size, color="#dce5f4", bold=False):
@@ -479,7 +468,7 @@ class Window:
     def work_area(self):
         if os.name == "nt":
             rect = wintypes.RECT()
-            if (ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(rect), 0)
+            if (WIN32.user.SystemParametersInfoW(48, 0, ctypes.byref(rect), 0)
                     and rect.right > rect.left and rect.bottom > rect.top):
                 return rect.left, rect.top, rect.right, rect.bottom
         return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -628,9 +617,7 @@ class Window:
 
     def panel_has_focus(self):
         if os.name == "nt":
-            user = ctypes.WinDLL("user32", use_last_error=True)
-            user.GetForegroundWindow.restype = wintypes.HWND
-            user.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+            user = WIN32.user
             process_id = wintypes.DWORD()
             user.GetWindowThreadProcessId(user.GetForegroundWindow(), ctypes.byref(process_id))
             # Include our settings dialog and combo popup; moving between controls is focus.
@@ -788,6 +775,11 @@ class Window:
                     self.ensure_visible()
                 except Exception:
                     log_exception("Visibility recovery", *sys.exc_info())
+                if self.gc_guard is not None:
+                    try:
+                        self.gc_guard.collect()
+                    except Exception:
+                        log_exception("GUI garbage collection", *sys.exc_info())
                 self.root.after(500, self.tick)
 
     def refresh(self):
@@ -868,12 +860,19 @@ class Window:
         self.root.destroy()
 
     def run(self):
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            self.stop.set()
+            # A bound worker retains this Window and its Tcl objects. Keep the
+            # main-thread owner alive until all workers have released it.
+            for worker in self.workers:
+                worker.join()
 
 
-def self_test(home):
+def self_test(home, gc_guard=None):
     """Exercise the actual Tk rendering without changing any live Codex records."""
-    window = Window(home, demo=True)
+    window = Window(home, demo=True, gc_guard=gc_guard)
     session = Session("self-test", Path("unused"), "本地模拟测试 · 不修改真实会话")
     window.snapshot = [session]
     window.running = True
@@ -979,14 +978,25 @@ def main():
     parser.add_argument("--once", action="store_true", help="Print a diagnostic snapshot without a window")
     parser.add_argument("--probe", action="store_true", help="Include HTTPS probes in --once")
     parser.add_argument("--self-test", action="store_true", help="Show simulated UI states, then save a test report and close")
+    parser.add_argument("--stress-test", type=int, metavar="SECONDS", help="Run isolated UI/native polling stress test (10-3600 seconds)")
     parser.add_argument("--output", type=Path, help="Save --once diagnostics as JSON (useful for a windowed EXE)")
     parser.add_argument("--follow-codex", action="store_true", help="Wait in the background and show only while the Codex desktop app is running")
     args = parser.parse_args()
-    if args.self_test:
+    if args.stress_test is not None:
+        if not 10 <= args.stress_test <= 3600:
+            parser.error("--stress-test must be between 10 and 3600 seconds")
+        from monitor_stress import run_stress_test
+        with GuiGarbageCollector() as gc_guard:
+            passed = run_stress_test(Window, codex_running, args.home, gc_guard,
+                                     args.stress_test, BASE / "stress-test-report.json")
+        raise SystemExit(0 if passed else 1)
+    elif args.self_test:
         import sys
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(encoding="utf-8")
-        raise SystemExit(0 if self_test(args.home) else 1)
+        with GuiGarbageCollector() as gc_guard:
+            passed = self_test(args.home, gc_guard)
+        raise SystemExit(0 if passed else 1)
     elif args.once:
         import sys
         if hasattr(sys.stdout, "reconfigure"):
@@ -1003,7 +1013,8 @@ def main():
     else:
         with single_instance() as acquired:
             if acquired:
-                Window(args.home, follow_codex=args.follow_codex).run()
+                with GuiGarbageCollector() as gc_guard:
+                    Window(args.home, follow_codex=args.follow_codex, gc_guard=gc_guard).run()
 
 
 if __name__ == "__main__":
